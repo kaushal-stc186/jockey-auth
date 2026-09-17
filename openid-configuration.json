@@ -1,8 +1,8 @@
 {
-  "issuer": "https://auth.yourdomain.com",
-  "authorization_endpoint": "https://auth.yourdomain.com/authorize",
-  "token_endpoint": "https://auth.yourdomain.com/token",
-  "jwks_uri": "https://auth.yourdomain.com/.well-known/jwks.json",
+  "issuer": "https://jockey-auth.onrender.com",
+  "authorization_endpoint": "https://jockey-auth.onrender.com/authorize",
+  "token_endpoint": "https://jockey-auth.onrender.com/token",
+  "jwks_uri": "https://jockey-auth.onrender.com/.well-known/jwks.json",
   "scopes_supported": ["openid", "email"],
   "response_types_supported": ["code"],
   "grant_types_supported": ["authorization_code", "refresh_token"],

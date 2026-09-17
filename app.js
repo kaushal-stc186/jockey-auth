@@ -4,10 +4,9 @@ const express = require('express');
 const openidConfiguration = require('./openid-configuration.json');
 
 const PORT = Number(process.env.PORT || 3000);
-const ISSUER = String(process.env.ISSUER || `http://localhost:${PORT}`).replace(
-  /\/$/,
-  '',
-);
+const ISSUER = String(
+  process.env.ISSUER || 'https://jockey-auth.onrender.com',
+).replace(/\/$/, '');
 
 const app = express();
 
