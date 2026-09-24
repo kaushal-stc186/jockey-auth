@@ -18,6 +18,9 @@ const STATIC_OTP = String(process.env.STATIC_OTP || '');
 const REDIRECT_URIS = csv(process.env.REDIRECT_URIS);
 const POST_LOGOUT_REDIRECT_URIS = csv(process.env.POST_LOGOUT_REDIRECT_URIS);
 const ACCESS_TTL = 3600;
+const INDIAN_MOBILE_RE = /^[6-9]\d{9}$/;
+const EMAIL_RE =
+  /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/;
 const DATA_DIR = path.join(__dirname, 'data');
 const USERS_PATH = path.join(DATA_DIR, 'users.json');
 const KEY_PATH = path.join(DATA_DIR, 'private.pem');
@@ -79,7 +82,7 @@ app.post('/authorize/phone', (req, res) => {
   if (!session) return;
   const phone = normalizePhone(req.body.phone);
   if (!phone) {
-    return res.status(400).send(phonePage('Enter a valid mobile number with country code'));
+    return res.status(400).send(phonePage('Enter a valid 10-digit Indian mobile number'));
   }
 
   const otp = STATIC_OTP || String(Math.floor(1000 + Math.random() * 9000));
@@ -109,8 +112,8 @@ app.post('/authorize/verify', (req, res) => {
 
   session.verified = true;
   const existing = users[session.phone];
-  if (existing?.email) return completeLogin(res, session, existing);
-  res.send(emailPage(session.phone));
+  if (hasProfile(existing)) return completeLogin(res, session, existing);
+  res.send(profilePage(session.phone, '', existing));
 });
 
 app.post('/authorize/email', (req, res) => {
@@ -120,21 +123,29 @@ app.post('/authorize/email', (req, res) => {
     return res.status(400).send(phonePage('Verify your mobile number first'));
   }
 
+  const firstName = normalizeName(req.body.first_name);
+  const lastName = normalizeName(req.body.last_name);
   const email = String(req.body.email || '').trim().toLowerCase();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).send(emailPage(session.phone, 'Enter a valid email'));
+  const draft = { firstName, lastName, email };
+  if (!firstName || !lastName) {
+    return res.status(400).send(profilePage(session.phone, 'Enter your first and last name', draft));
+  }
+  if (!EMAIL_RE.test(email)) {
+    return res.status(400).send(profilePage(session.phone, 'Enter a valid email', draft));
   }
 
   const taken = Object.entries(users).find(
     ([phone, user]) => user.email === email && phone !== session.phone,
   );
   if (taken) {
-    return res.status(409).send(emailPage(session.phone, 'This email is already linked to another number'));
+    return res.status(409).send(profilePage(session.phone, 'This email is already linked to another number', draft));
   }
 
   const user = {
     sub: users[session.phone]?.sub || crypto.createHash('sha256').update(session.phone).digest('hex').slice(0, 24),
     email,
+    firstName,
+    lastName,
     phone: session.phone,
   };
   users[session.phone] = user;
@@ -252,6 +263,11 @@ function oidcClaims(user, nonce, clientId, includeStandard) {
     email_verified: true,
     phone_number: user.phone,
     phone_number_verified: true,
+    ...(user.firstName ? { given_name: user.firstName } : {}),
+    ...(user.lastName ? { family_name: user.lastName } : {}),
+    ...(user.firstName || user.lastName
+      ? { name: [user.firstName, user.lastName].filter(Boolean).join(' ') }
+      : {}),
   };
 }
 
@@ -331,39 +347,95 @@ function phonePage(error) {
   return page(
     'Sign in',
     `${error ? `<p class="error">${esc(error)}</p>` : ''}
-     <form method="post" action="/authorize/phone">
-       <label>Mobile number</label>
-       <input name="phone" type="tel" inputmode="tel" placeholder="+91 98765 43210" required>
+     <form id="phone-form" method="post" action="/authorize/phone">
+       <label for="phone">Mobile number</label>
+       <div class="phone">
+         <span>IN (+91)</span>
+         <input id="phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel" placeholder="Enter Phone No." required>
+       </div>
        <button type="submit">Send OTP</button>
-     </form>`,
+     </form>
+     <script>
+       const form = document.getElementById('phone-form');
+       const input = document.getElementById('phone');
+       const indianMobile = /^[6-9]\\d{9}$/;
+       let previous = '';
+       let lastAutoSent = '';
+
+       function normalizeIndianMobile(text) {
+         let digits = String(text || '').replace(/[^0-9]/g, '');
+         if (digits.length === 12 && digits.startsWith('91')) digits = digits.slice(2);
+         else if (digits.length === 11 && digits.startsWith('0')) digits = digits.slice(1);
+         else if (digits.length > 10) digits = digits.slice(-10);
+         return digits;
+       }
+
+       input.addEventListener('input', () => {
+         const raw = input.value;
+         const previousLength = previous.length;
+         const inputDigits = raw.replace(/[^0-9]/g, '');
+         const appendingPastLimit = previousLength === 10 && inputDigits.length > 10 && inputDigits.startsWith(previous);
+         const updated = appendingPastLimit ? previous : normalizeIndianMobile(raw);
+         input.value = updated;
+         previous = updated;
+         if (!indianMobile.test(updated)) {
+           lastAutoSent = '';
+           return;
+         }
+         const arrivedInOneShot = updated.length - previousLength > 1 || /[^\\d]/.test(raw);
+         if (arrivedInOneShot && lastAutoSent !== updated) {
+           lastAutoSent = updated;
+           form.requestSubmit();
+         }
+       });
+
+       form.addEventListener('submit', (event) => {
+         if (!indianMobile.test(input.value)) {
+           event.preventDefault();
+         }
+       });
+     </script>`,
   );
 }
 
 function otpPage(phone, error) {
+  const national = nationalNumber(phone);
   return page(
     'Verify OTP',
-    `<p>OTP sent to ${esc(phone)}</p>
+    `<p>OTP sent to +91 ${esc(national)}</p>
      ${error ? `<p class="error">${esc(error)}</p>` : ''}
-     <form method="post" action="/authorize/verify">
-       <label>4-digit OTP</label>
-       <input name="otp" inputmode="numeric" maxlength="4" required>
+     <form id="otp-form" method="post" action="/authorize/verify">
+       <label for="otp">4-digit OTP</label>
+       <input id="otp" name="otp" inputmode="numeric" autocomplete="one-time-code" maxlength="4" required>
        <button type="submit">Verify</button>
      </form>
      <form method="post" action="/authorize/phone">
-       <input type="hidden" name="phone" value="${esc(phone)}">
+       <input type="hidden" name="phone" value="${esc(national)}">
        <button type="submit" class="link">Resend OTP</button>
-     </form>`,
+     </form>
+     <script>
+       const otp = document.getElementById('otp');
+       otp.addEventListener('input', () => {
+         otp.value = otp.value.replace(/\\D/g, '').slice(0, 4);
+         if (/^\\d{4}$/.test(otp.value)) otp.form.requestSubmit();
+       });
+     </script>`,
   );
 }
 
-function emailPage(phone, error) {
+function profilePage(phone, error, values) {
+  const profile = values || {};
   return page(
-    'Add email',
-    `<p>No email is saved for ${esc(phone)}. Add one to continue.</p>
+    'Your details',
+    `<p>Add your name and email for +91 ${esc(nationalNumber(phone))}.</p>
      ${error ? `<p class="error">${esc(error)}</p>` : ''}
      <form method="post" action="/authorize/email">
-       <label>Email</label>
-       <input name="email" type="email" placeholder="you@example.com" required>
+       <label for="first_name">First name</label>
+       <input id="first_name" name="first_name" autocomplete="given-name" autocapitalize="words" value="${esc(profile.firstName)}" required>
+       <label for="last_name">Last name</label>
+       <input id="last_name" name="last_name" autocomplete="family-name" autocapitalize="words" value="${esc(profile.lastName)}" required>
+       <label for="email">Email</label>
+       <input id="email" name="email" type="email" autocomplete="email" value="${esc(profile.email)}" required>
        <button type="submit">Continue</button>
      </form>`,
   );
@@ -381,6 +453,9 @@ function page(title, body) {
   h1 { margin: 0; font-size: 20px; }
   form { display: grid; gap: 12px; }
   input { padding: 12px; border-radius: 8px; border: 1px solid #333; background: #111; color: inherit; }
+  .phone { display: flex; align-items: center; gap: 8px; padding: 0 12px; border-radius: 8px; border: 1px solid #333; background: #111; }
+  .phone span { white-space: nowrap; }
+  .phone input { border: 0; background: transparent; padding: 12px 0; flex: 1; min-width: 0; }
   button { padding: 12px; border: 0; border-radius: 8px; background: #e10600; color: #fff; font-weight: 600; }
   button.link { background: transparent; color: #bbb; font-weight: 500; }
   .error { color: #ff8a80; margin: 0; }
@@ -425,12 +500,37 @@ function saveUsers() {
   fs.writeFileSync(USERS_PATH, JSON.stringify(users, null, 2));
 }
 
+function normalizeIndianMobile(text) {
+  let digits = String(text || '').replace(/[^0-9]/g, '');
+  if (digits.length === 12 && digits.startsWith('91')) {
+    digits = digits.slice(2);
+  } else if (digits.length === 11 && digits.startsWith('0')) {
+    digits = digits.slice(1);
+  } else if (digits.length > 10) {
+    digits = digits.slice(-10);
+  }
+  return digits;
+}
+
 function normalizePhone(input) {
-  const digits = String(input || '').replace(/\D/g, '');
-  if (digits.length === 10) return `+91${digits}`;
-  if (digits.length === 12 && digits.startsWith('91')) return `+${digits}`;
-  if (String(input).trim().startsWith('+') && digits.length >= 10) return `+${digits}`;
-  return null;
+  const digits = normalizeIndianMobile(input);
+  if (!INDIAN_MOBILE_RE.test(digits)) return null;
+  return `+91${digits}`;
+}
+
+function nationalNumber(phone) {
+  return normalizeIndianMobile(phone);
+}
+
+function normalizeName(value) {
+  return String(value || '')
+    .replace(/[^a-zA-Z\s\-']/g, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+}
+
+function hasProfile(user) {
+  return Boolean(user?.email && user?.firstName && user?.lastName);
 }
 
 function csv(value) {
