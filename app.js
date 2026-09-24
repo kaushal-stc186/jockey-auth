@@ -123,22 +123,26 @@ app.post('/authorize/email', (req, res) => {
     return res.status(400).send(phonePage('Verify your mobile number first'));
   }
 
+  const existing = users[session.phone] || {};
+  const askEmail = !existing.email;
   const firstName = normalizeName(req.body.first_name);
   const lastName = normalizeName(req.body.last_name);
-  const email = String(req.body.email || '').trim().toLowerCase();
+  const email = askEmail ? String(req.body.email || '').trim().toLowerCase() : existing.email;
   const draft = { firstName, lastName, email };
   if (!firstName || !lastName) {
-    return res.status(400).send(profilePage(session.phone, 'Enter your first and last name', draft));
+    return res.status(400).send(profilePage(session.phone, 'Enter your first and last name', draft, askEmail));
   }
-  if (!EMAIL_RE.test(email)) {
-    return res.status(400).send(profilePage(session.phone, 'Enter a valid email', draft));
+  if (askEmail && !EMAIL_RE.test(email)) {
+    return res.status(400).send(profilePage(session.phone, 'Enter a valid email', draft, true));
   }
 
-  const taken = Object.entries(users).find(
-    ([phone, user]) => user.email === email && phone !== session.phone,
-  );
-  if (taken) {
-    return res.status(409).send(profilePage(session.phone, 'This email is already linked to another number', draft));
+  if (askEmail) {
+    const taken = Object.entries(users).find(
+      ([phone, user]) => user.email === email && phone !== session.phone,
+    );
+    if (taken) {
+      return res.status(409).send(profilePage(session.phone, 'This email is already linked to another number', draft, true));
+    }
   }
 
   const user = {
@@ -423,19 +427,20 @@ function otpPage(phone, error) {
   );
 }
 
-function profilePage(phone, error, values) {
+function profilePage(phone, error, values, askEmail) {
   const profile = values || {};
+  const showEmail = askEmail !== undefined ? askEmail : !profile.email;
   return page(
-    'Your details',
-    `<p>Add your name and email for +91 ${esc(nationalNumber(phone))}.</p>
+    showEmail ? 'Your details' : 'Your name',
+    `<p>${showEmail ? 'Add your name and email' : 'Add your first and last name'} for +91 ${esc(nationalNumber(phone))}.</p>
      ${error ? `<p class="error">${esc(error)}</p>` : ''}
      <form method="post" action="/authorize/email">
        <label for="first_name">First name</label>
        <input id="first_name" name="first_name" autocomplete="given-name" autocapitalize="words" value="${esc(profile.firstName)}" required>
        <label for="last_name">Last name</label>
        <input id="last_name" name="last_name" autocomplete="family-name" autocapitalize="words" value="${esc(profile.lastName)}" required>
-       <label for="email">Email</label>
-       <input id="email" name="email" type="email" autocomplete="email" value="${esc(profile.email)}" required>
+       ${showEmail ? `<label for="email">Email</label>
+       <input id="email" name="email" type="email" autocomplete="email" value="${esc(profile.email)}" required>` : ''}
        <button type="submit">Continue</button>
      </form>`,
   );
@@ -448,18 +453,91 @@ function page(title, body) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
 <style>
-  body { font-family: ui-sans-serif, system-ui, sans-serif; background: #111; color: #f5f5f5; display: grid; place-items: center; min-height: 100vh; margin: 0; }
-  main { width: min(380px, calc(100vw - 32px)); background: #1c1c1c; padding: 24px; border-radius: 12px; display: grid; gap: 12px; }
-  h1 { margin: 0; font-size: 20px; }
-  form { display: grid; gap: 12px; }
-  input { padding: 12px; border-radius: 8px; border: 1px solid #333; background: #111; color: inherit; }
-  .phone { display: flex; align-items: center; gap: 8px; padding: 0 12px; border-radius: 8px; border: 1px solid #333; background: #111; }
-  .phone span { white-space: nowrap; }
-  .phone input { border: 0; background: transparent; padding: 12px 0; flex: 1; min-width: 0; }
-  button { padding: 12px; border: 0; border-radius: 8px; background: #e10600; color: #fff; font-weight: 600; }
-  button.link { background: transparent; color: #bbb; font-weight: 500; }
-  .error { color: #ff8a80; margin: 0; }
-  p { margin: 0; color: #cfcfcf; }
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    display: grid;
+    place-items: center;
+    padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+    background: #f6f6f6;
+    color: #221f20;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+  }
+  main {
+    width: min(420px, 100%);
+    display: grid;
+    align-content: start;
+    gap: 16px;
+    padding: 28px 20px;
+    background: #fff;
+    border: 1px solid #ececec;
+    border-radius: 16px;
+  }
+  h1 { margin: 0; font-size: 1.375rem; line-height: 1.3; }
+  p { margin: 0; color: #5c5859; line-height: 1.45; }
+  form { display: grid; align-content: start; gap: 8px; }
+  label { font-size: 0.875rem; font-weight: 600; }
+  input {
+    width: 100%;
+    min-height: 48px;
+    padding: 12px 14px;
+    border: 1px solid #d9d9d9;
+    border-radius: 10px;
+    background: #fff;
+    color: #221f20;
+    font-size: 16px;
+  }
+  input:focus { outline: 2px solid #221f20; outline-offset: 1px; }
+  .phone {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 48px;
+    padding: 0 14px;
+    border: 1px solid #d9d9d9;
+    border-radius: 10px;
+    background: #fff;
+  }
+  .phone:focus-within { outline: 2px solid #221f20; outline-offset: 1px; }
+  .phone span { font-weight: 600; white-space: nowrap; }
+  .phone input { flex: 1; min-width: 0; min-height: 46px; padding: 12px 0; border: 0; }
+  .phone input:focus { outline: none; }
+  input[name="otp"] {
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: 0.4em;
+    text-align: center;
+  }
+  button {
+    min-height: 48px;
+    margin-top: 8px;
+    padding: 12px 16px;
+    border: 0;
+    border-radius: 10px;
+    background: #221f20;
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+  }
+  button.link {
+    margin-top: 0;
+    background: transparent;
+    color: #221f20;
+    font-weight: 500;
+    text-decoration: underline;
+  }
+  .error { color: #c62828; }
+  @media (max-width: 480px) {
+    body { place-items: stretch; align-items: start; }
+    main {
+      width: 100%;
+      min-height: calc(100dvh - 32px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+      border: 0;
+      border-radius: 0;
+    }
+  }
 </style>
 <main>
   <h1>${esc(title)}</h1>
