@@ -14,6 +14,12 @@ const CLIENT_ID = process.env.CLIENT_ID || 'jockey-mobile-auth';
 const CLIENT_SECRET = process.env.CLIENT_SECRET || '';
 const SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID =
   process.env.SHOPIFY_CUSTOMER_ACCOUNT_CLIENT_ID || '';
+const SHOPIFY_SHOP = String(process.env.SHOPIFY_SHOP || '')
+  .replace(/^https?:\/\//, '')
+  .replace(/\/$/, '');
+const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
+const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY || '';
+const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || '';
 const STATIC_OTP = String(process.env.STATIC_OTP || '');
 const REDIRECT_URIS = csv(process.env.REDIRECT_URIS);
 const POST_LOGOUT_REDIRECT_URIS = csv(process.env.POST_LOGOUT_REDIRECT_URIS);
@@ -94,7 +100,7 @@ app.post('/authorize/phone', (req, res) => {
   res.send(otpPage(phone));
 });
 
-app.post('/authorize/verify', (req, res) => {
+app.post('/authorize/verify', async (req, res) => {
   const session = getLoginSession(req, res);
   if (!session) return;
   if (!session.phone || !session.otp) return res.redirect('/authorize');
@@ -111,9 +117,13 @@ app.post('/authorize/verify', (req, res) => {
   }
 
   session.verified = true;
-  const existing = users[session.phone];
-  if (hasProfile(existing)) return completeLogin(res, session, existing);
-  res.send(profilePage(session.phone, '', existing));
+  const shopifyCustomer = await lookupShopifyCustomer(session.phone);
+  const profile = mergedProfile(users[session.phone], shopifyCustomer);
+  session.profile = profile;
+  if (hasProfile(profile)) {
+    return completeLogin(res, session, saveUser(session.phone, profile));
+  }
+  res.send(profilePage(session.phone, '', profile));
 });
 
 app.post('/authorize/email', (req, res) => {
@@ -123,17 +133,18 @@ app.post('/authorize/email', (req, res) => {
     return res.status(400).send(phonePage('Verify your mobile number first'));
   }
 
-  const existing = users[session.phone] || {};
-  const askEmail = !existing.email;
-  const firstName = normalizeName(req.body.first_name);
-  const lastName = normalizeName(req.body.last_name);
-  const email = askEmail ? String(req.body.email || '').trim().toLowerCase() : existing.email;
-  const draft = { firstName, lastName, email };
-  if (!firstName || !lastName) {
-    return res.status(400).send(profilePage(session.phone, 'Enter your first and last name', draft, askEmail));
+  const known = session.profile || {};
+  const askNames = !known.firstName || !known.lastName;
+  const askEmail = !known.email;
+  const firstName = askNames ? normalizeName(req.body.first_name) : known.firstName;
+  const lastName = askNames ? normalizeName(req.body.last_name) : known.lastName;
+  const email = askEmail ? String(req.body.email || '').trim().toLowerCase() : known.email;
+  const draft = { firstName, lastName, email, askNames, askEmail };
+  if (askNames && (!firstName || !lastName)) {
+    return res.status(400).send(profilePage(session.phone, 'Enter your first and last name', draft));
   }
   if (askEmail && !EMAIL_RE.test(email)) {
-    return res.status(400).send(profilePage(session.phone, 'Enter a valid email', draft, true));
+    return res.status(400).send(profilePage(session.phone, 'Enter a valid email', draft));
   }
 
   if (askEmail) {
@@ -141,20 +152,11 @@ app.post('/authorize/email', (req, res) => {
       ([phone, user]) => user.email === email && phone !== session.phone,
     );
     if (taken) {
-      return res.status(409).send(profilePage(session.phone, 'This email is already linked to another number', draft, true));
+      return res.status(409).send(profilePage(session.phone, 'This email is already linked to another number', draft));
     }
   }
 
-  const user = {
-    sub: users[session.phone]?.sub || crypto.createHash('sha256').update(session.phone).digest('hex').slice(0, 24),
-    email,
-    firstName,
-    lastName,
-    phone: session.phone,
-  };
-  users[session.phone] = user;
-  saveUsers();
-  completeLogin(res, session, user);
+  completeLogin(res, session, saveUser(session.phone, draft));
 });
 
 app.post('/token', (req, res) => {
@@ -427,19 +429,26 @@ function otpPage(phone, error) {
   );
 }
 
-function profilePage(phone, error, values, askEmail) {
+function profilePage(phone, error, values) {
   const profile = values || {};
-  const showEmail = askEmail !== undefined ? askEmail : !profile.email;
+  const askNames = profile.askNames !== undefined ? profile.askNames : !profile.firstName || !profile.lastName;
+  const askEmail = profile.askEmail !== undefined ? profile.askEmail : !profile.email;
+  const title = askNames && askEmail ? 'Your details' : askNames ? 'Your name' : 'Your email';
+  const intro = askNames && askEmail
+    ? 'Add your name and email'
+    : askNames
+      ? 'Add your first and last name'
+      : 'Add your email';
   return page(
-    showEmail ? 'Your details' : 'Your name',
-    `<p>${showEmail ? 'Add your name and email' : 'Add your first and last name'} for +91 ${esc(nationalNumber(phone))}.</p>
+    title,
+    `<p>${intro} for +91 ${esc(nationalNumber(phone))}.</p>
      ${error ? `<p class="error">${esc(error)}</p>` : ''}
      <form method="post" action="/authorize/email">
-       <label for="first_name">First name</label>
+       ${askNames ? `<label for="first_name">First name</label>
        <input id="first_name" name="first_name" autocomplete="given-name" autocapitalize="words" value="${esc(profile.firstName)}" required>
        <label for="last_name">Last name</label>
-       <input id="last_name" name="last_name" autocomplete="family-name" autocapitalize="words" value="${esc(profile.lastName)}" required>
-       ${showEmail ? `<label for="email">Email</label>
+       <input id="last_name" name="last_name" autocomplete="family-name" autocapitalize="words" value="${esc(profile.lastName)}" required>` : ''}
+       ${askEmail ? `<label for="email">Email</label>
        <input id="email" name="email" type="email" autocomplete="email" value="${esc(profile.email)}" required>` : ''}
        <button type="submit">Continue</button>
      </form>`,
@@ -609,6 +618,66 @@ function normalizeName(value) {
 
 function hasProfile(user) {
   return Boolean(user?.email && user?.firstName && user?.lastName);
+}
+
+function mergedProfile(local, shopify) {
+  return {
+    firstName: local?.firstName || shopify?.firstName || '',
+    lastName: local?.lastName || shopify?.lastName || '',
+    email: local?.email || shopify?.email || '',
+  };
+}
+
+function saveUser(phone, profile) {
+  const user = {
+    sub: users[phone]?.sub || crypto.createHash('sha256').update(phone).digest('hex').slice(0, 24),
+    email: profile.email,
+    firstName: profile.firstName,
+    lastName: profile.lastName,
+    phone,
+  };
+  users[phone] = user;
+  saveUsers();
+  return user;
+}
+
+async function lookupShopifyCustomer(phone) {
+  if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_ACCESS_TOKEN) return null;
+  try {
+    const response = await fetch(`https://${SHOPIFY_SHOP}/admin/api/2026-07/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_ACCESS_TOKEN,
+      },
+      body: JSON.stringify({
+        query: `query($identifier: CustomerIdentifierInput!) {
+          customer: customerByIdentifier(identifier: $identifier) {
+            firstName
+            lastName
+            email
+            defaultEmailAddress { emailAddress }
+          }
+        }`,
+        variables: { identifier: { phoneNumber: phone } },
+      }),
+    });
+    const json = await response.json();
+    const customer = json?.data?.customer;
+    if (!response.ok || json?.errors) {
+      console.log(`[shopify] lookup ${response.status}`);
+      return null;
+    }
+    if (!customer) return null;
+    return {
+      firstName: normalizeName(customer.firstName),
+      lastName: normalizeName(customer.lastName),
+      email: String(customer.email || customer.defaultEmailAddress?.emailAddress || '').trim().toLowerCase(),
+    };
+  } catch (error) {
+    console.log(`[shopify] lookup failed ${error.message}`);
+    return null;
+  }
 }
 
 function csv(value) {
