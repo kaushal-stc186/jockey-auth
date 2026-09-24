@@ -120,13 +120,16 @@ app.post('/authorize/verify', async (req, res) => {
   const shopifyCustomer = await lookupShopifyCustomer(session.phone);
   const profile = mergedProfile(users[session.phone], shopifyCustomer);
   session.profile = profile;
+  session.shopifyCustomerId = shopifyCustomer?.id || '';
   if (hasProfile(profile)) {
-    return completeLogin(res, session, saveUser(session.phone, profile));
+    const user = saveUser(session.phone, profile);
+    await syncShopifyCustomer(session.shopifyCustomerId, user);
+    return completeLogin(res, session, user);
   }
   res.send(profilePage(session.phone, '', profile));
 });
 
-app.post('/authorize/email', (req, res) => {
+app.post('/authorize/email', async (req, res) => {
   const session = getLoginSession(req, res);
   if (!session) return;
   if (!session.verified || !session.phone) {
@@ -156,7 +159,9 @@ app.post('/authorize/email', (req, res) => {
     }
   }
 
-  completeLogin(res, session, saveUser(session.phone, draft));
+  const user = saveUser(session.phone, draft);
+  await syncShopifyCustomer(session.shopifyCustomerId, user);
+  completeLogin(res, session, user);
 });
 
 app.post('/token', (req, res) => {
@@ -653,6 +658,7 @@ async function lookupShopifyCustomer(phone) {
       body: JSON.stringify({
         query: `query($identifier: CustomerIdentifierInput!) {
           customer: customerByIdentifier(identifier: $identifier) {
+            id
             firstName
             lastName
             email
@@ -670,6 +676,7 @@ async function lookupShopifyCustomer(phone) {
     }
     if (!customer) return null;
     return {
+      id: customer.id,
       firstName: normalizeName(customer.firstName),
       lastName: normalizeName(customer.lastName),
       email: String(customer.email || customer.defaultEmailAddress?.emailAddress || '').trim().toLowerCase(),
@@ -677,6 +684,41 @@ async function lookupShopifyCustomer(phone) {
   } catch (error) {
     console.log(`[shopify] lookup failed ${error.message}`);
     return null;
+  }
+}
+
+async function syncShopifyCustomer(customerId, profile) {
+  if (!customerId || !SHOPIFY_SHOP || !SHOPIFY_ADMIN_ACCESS_TOKEN) return;
+  const input = { id: customerId };
+  if (profile?.firstName) input.firstName = profile.firstName;
+  if (profile?.lastName) input.lastName = profile.lastName;
+  if (profile?.email) input.email = profile.email;
+  if (!input.firstName && !input.lastName && !input.email) return;
+
+  try {
+    const response = await fetch(`https://${SHOPIFY_SHOP}/admin/api/2026-07/graphql.json`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_ACCESS_TOKEN,
+      },
+      body: JSON.stringify({
+        query: `mutation($input: CustomerInput!) {
+          customerUpdate(input: $input) {
+            userErrors { field message }
+          }
+        }`,
+        variables: { input },
+      }),
+    });
+    const json = await response.json();
+    const userErrors = json?.data?.customerUpdate?.userErrors || [];
+    if (!response.ok || json?.errors || userErrors.length) {
+      const message = userErrors.map((error) => error.message).join('; ');
+      console.log(`[shopify] update ${response.status} ${message}`);
+    }
+  } catch (error) {
+    console.log(`[shopify] update failed ${error.message}`);
   }
 }
 
