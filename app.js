@@ -144,7 +144,8 @@ app.post('/authorize/email', (req, res) => {
 
 app.post('/token', (req, res) => {
   const body = req.body || {};
-  if (body.client_id !== CLIENT_ID || body.client_secret !== CLIENT_SECRET) {
+  const client = clientCredentials(req);
+  if (client.id !== CLIENT_ID || client.secret !== CLIENT_SECRET) {
     return res.status(401).json({ error: 'invalid_client' });
   }
 
@@ -252,6 +253,32 @@ function oidcClaims(user, nonce, clientId, includeStandard) {
     phone_number: user.phone,
     phone_number_verified: true,
   };
+}
+
+function clientCredentials(req) {
+  const header = String(req.headers.authorization || '');
+  const basic = header.match(/^Basic\s+(.+)$/i);
+  if (basic) {
+    const decoded = Buffer.from(basic[1], 'base64').toString('utf8');
+    const sep = decoded.indexOf(':');
+    if (sep !== -1) {
+      return {
+        id: safeDecode(decoded.slice(0, sep)),
+        secret: safeDecode(decoded.slice(sep + 1)),
+      };
+    }
+  }
+
+  const body = req.body || {};
+  return { id: body.client_id, secret: body.client_secret };
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function validateAuthorize(params) {
