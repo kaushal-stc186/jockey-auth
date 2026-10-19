@@ -21,9 +21,15 @@ const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || '';
 const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY || '';
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET || '';
 const STATIC_OTP = String(process.env.STATIC_OTP || '');
+const STOREFRONT_LOGIN_URL = String(process.env.STOREFRONT_LOGIN_URL || '').replace(/\/$/, '');
+const STOREFRONT_ORIGIN = (
+  String(process.env.STOREFRONT_ORIGIN || '').replace(/\/$/, '') ||
+  (STOREFRONT_LOGIN_URL ? new URL(STOREFRONT_LOGIN_URL).origin : '')
+);
 const REDIRECT_URIS = csv(process.env.REDIRECT_URIS);
 const POST_LOGOUT_REDIRECT_URIS = csv(process.env.POST_LOGOUT_REDIRECT_URIS);
 const ACCESS_TTL = 3600;
+const LOGIN_SESSION_TTL_MS = 600_000;
 const INDIAN_MOBILE_RE = /^[6-9]\d{9}$/;
 const EMAIL_RE =
   /^(([^<>()[\]\\.,;:\s@"]+(\.[^<>()[\]\\.,;:\s@"]+)*)|(".+"))@((\[[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\])|(([a-zA-Z\-0-9]+\.)+[a-zA-Z]{2,}))$/;
@@ -43,6 +49,7 @@ const KID = crypto
 
 const users = loadUsers();
 const loginSessions = new Map();
+const loginTickets = new Map();
 const authCodes = new Map();
 const refreshTokens = new Map();
 const accessTokens = new Map();
@@ -50,6 +57,7 @@ const accessTokens = new Map();
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+app.use('/api/login', storefrontCors);
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
@@ -80,7 +88,133 @@ app.get('/authorize', (req, res) => {
   });
 
   setSid(res, sid);
+
+  if (STOREFRONT_LOGIN_URL) {
+    const ticket = mintLoginTicket(sid);
+    const target = new URL(STOREFRONT_LOGIN_URL);
+    target.searchParams.set('ticket', ticket);
+    return res.redirect(302, target.toString());
+  }
+
   res.send(phonePage());
+});
+
+app.post('/api/login/phone', (req, res) => {
+  const session = getSessionFromTicket(req, res);
+  if (!session) return;
+
+  const phone = normalizePhone(req.body?.phone);
+  if (!phone) {
+    return res.status(400).json({ error: 'Enter a valid 10-digit Indian mobile number' });
+  }
+
+  issueOtp(session, phone);
+  res.json({ ok: true, phone });
+});
+
+app.post('/api/login/resend', (req, res) => {
+  const session = getSessionFromTicket(req, res);
+  if (!session) return;
+
+  const phone = normalizePhone(req.body?.phone || session.phone);
+  if (!phone) {
+    return res.status(400).json({ error: 'Enter a valid 10-digit Indian mobile number' });
+  }
+  if (session.phone && phone !== session.phone) {
+    return res.status(400).json({ error: 'Phone number does not match this login session' });
+  }
+
+  issueOtp(session, phone);
+  res.json({ ok: true, phone });
+});
+
+app.post('/api/login/verify', async (req, res) => {
+  const session = getSessionFromTicket(req, res);
+  if (!session) return;
+
+  if (!session.phone || !session.otp) {
+    return res.status(400).json({ error: 'Request an OTP first' });
+  }
+  if (Date.now() > session.otpExp) {
+    return res.status(400).json({ error: 'OTP expired. Request a new one.' });
+  }
+
+  session.attempts += 1;
+  if (session.attempts > 5) {
+    return res.status(429).json({ error: 'Too many attempts. Request a new OTP.' });
+  }
+  if (String(req.body?.otp || '') !== session.otp) {
+    return res.status(401).json({ error: 'Incorrect OTP' });
+  }
+
+  session.verified = true;
+  const shopifyCustomer = await lookupShopifyCustomer(session.phone);
+  const profile = mergedProfile(users[session.phone], shopifyCustomer);
+  session.profile = profile;
+  session.shopifyCustomerId = shopifyCustomer?.id || '';
+
+  if (hasProfile(profile)) {
+    const user = saveUser(session.phone, profile);
+    await syncShopifyCustomer(session.shopifyCustomerId, user);
+    return res.json({ redirectTo: finishLogin(session, user) });
+  }
+
+  const askNames = !profile.firstName || !profile.lastName;
+  const askEmail = !profile.email;
+  res.json({
+    needProfile: true,
+    phone: session.phone,
+    fields: {
+      askNames,
+      askEmail,
+      firstName: profile.firstName || '',
+      lastName: profile.lastName || '',
+      email: profile.email || '',
+    },
+  });
+});
+
+app.post('/api/login/profile', async (req, res) => {
+  const session = getSessionFromTicket(req, res);
+  if (!session) return;
+
+  if (!session.verified || !session.phone) {
+    return res.status(400).json({ error: 'Verify your mobile number first' });
+  }
+
+  const known = session.profile || {};
+  const askNames = !known.firstName || !known.lastName;
+  const askEmail = !known.email;
+  const body = req.body || {};
+  const firstName = askNames
+    ? normalizeName(body.firstName ?? body.first_name)
+    : known.firstName;
+  const lastName = askNames
+    ? normalizeName(body.lastName ?? body.last_name)
+    : known.lastName;
+  const email = askEmail
+    ? String(body.email || '').trim().toLowerCase()
+    : known.email;
+
+  if (askNames && (!firstName || !lastName)) {
+    return res.status(400).json({ error: 'Enter your first and last name' });
+  }
+  if (askEmail && !EMAIL_RE.test(email)) {
+    return res.status(400).json({ error: 'Enter a valid email' });
+  }
+
+  if (askEmail) {
+    const taken = Object.entries(users).find(
+      ([phone, user]) => user.email === email && phone !== session.phone,
+    );
+    if (taken) {
+      return res.status(409).json({ error: 'This email is already linked to another number' });
+    }
+  }
+
+  const user = saveUser(session.phone, { firstName, lastName, email });
+  await syncShopifyCustomer(session.shopifyCustomerId, user);
+  res.json({ redirectTo: finishLogin(session, user) });
 });
 
 app.post('/authorize/phone', (req, res) => {
@@ -91,12 +225,7 @@ app.post('/authorize/phone', (req, res) => {
     return res.status(400).send(phonePage('Enter a valid 10-digit Indian mobile number'));
   }
 
-  const otp = STATIC_OTP || String(Math.floor(1000 + Math.random() * 9000));
-  session.phone = phone;
-  session.otp = otp;
-  session.otpExp = Date.now() + 5 * 60 * 1000;
-  session.attempts = 0;
-  console.log(`[otp] ${phone} ${otp}`);
+  issueOtp(session, phone);
   res.send(otpPage(phone));
 });
 
@@ -223,6 +352,10 @@ app.listen(PORT, () => {
 });
 
 function completeLogin(res, session, user) {
+  res.redirect(302, finishLogin(session, user));
+}
+
+function finishLogin(session, user) {
   const code = randomToken();
   authCodes.set(code, {
     user,
@@ -238,8 +371,83 @@ function completeLogin(res, session, user) {
   const target = new URL(session.redirectUri);
   target.searchParams.set('code', code);
   if (session.state) target.searchParams.set('state', session.state);
-  loginSessions.delete(session.sid);
-  res.redirect(302, target.toString());
+  clearLoginSession(session.sid);
+  return target.toString();
+}
+
+function issueOtp(session, phone) {
+  const otp = STATIC_OTP || String(Math.floor(1000 + Math.random() * 9000));
+  session.phone = phone;
+  session.otp = otp;
+  session.otpExp = Date.now() + 5 * 60 * 1000;
+  session.attempts = 0;
+  session.verified = false;
+  console.log(`[otp] ${phone} ${otp}`);
+}
+
+function storefrontCors(req, res, next) {
+  if (STOREFRONT_ORIGIN) {
+    const origin = String(req.headers.origin || '');
+    if (origin === STOREFRONT_ORIGIN) {
+      res.setHeader('Access-Control-Allow-Origin', STOREFRONT_ORIGIN);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Login-Ticket');
+    }
+  }
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+  next();
+}
+
+function mintLoginTicket(sid) {
+  const ticket = randomToken();
+  loginTickets.set(ticket, {
+    sid,
+    exp: Date.now() + LOGIN_SESSION_TTL_MS,
+  });
+  return ticket;
+}
+
+function readLoginTicket(req) {
+  const header = String(req.headers['x-login-ticket'] || '').trim();
+  if (header) return header;
+  return String(req.body?.ticket || req.query?.ticket || '').trim();
+}
+
+function getSessionFromTicket(req, res) {
+  const ticket = readLoginTicket(req);
+  if (!ticket) {
+    res.status(401).json({ error: 'Missing login ticket' });
+    return null;
+  }
+
+  const binding = loginTickets.get(ticket);
+  if (!binding || binding.exp < Date.now()) {
+    loginTickets.delete(ticket);
+    res.status(401).json({ error: 'Login session expired. Start again from the store.' });
+    return null;
+  }
+
+  const session = loginSessions.get(binding.sid);
+  if (!session) {
+    loginTickets.delete(ticket);
+    res.status(401).json({ error: 'Login session expired. Start again from the store.' });
+    return null;
+  }
+
+  session.sid = binding.sid;
+  session.ticket = ticket;
+  return session;
+}
+
+function clearLoginSession(sid) {
+  if (!sid) return;
+  loginSessions.delete(sid);
+  for (const [ticket, binding] of loginTickets.entries()) {
+    if (binding.sid === sid) loginTickets.delete(ticket);
+  }
 }
 
 function issueTokens(record) {
@@ -342,7 +550,7 @@ function getLoginSession(req, res) {
 
 function newSession(oauth) {
   const sid = randomToken();
-  loginSessions.set(sid, oauth);
+  loginSessions.set(sid, { ...oauth, createdAt: Date.now() });
   return sid;
 }
 
@@ -350,7 +558,7 @@ function setSid(res, sid) {
   const secure = ISSUER.startsWith('https') ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
-    `jockey_auth=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600${secure}`,
+    `jockey_auth=${sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(LOGIN_SESSION_TTL_MS / 1000)}${secure}`,
   );
 }
 

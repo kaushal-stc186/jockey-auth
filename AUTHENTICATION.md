@@ -1,6 +1,11 @@
 # Customer authentication
 
-Shopify Customer Accounts does not render a login form, and the storefront does not either. Shopify redirects the browser to this identity provider. This server responds with its own HTML pages for the phone, OTP, and missing profile fields. After the customer is verified, this server redirects the browser back to Shopify with an authorization code, and Shopify opens the customer session.
+Shopify Customer Accounts redirects the browser to this identity provider for OIDC. This server validates the authorize request, then either:
+
+1. **Storefront UI (preferred):** redirects to a Shopify theme page that collects phone, OTP, and missing profile fields via JSON APIs, or
+2. **IdP HTML fallback:** when `STOREFRONT_LOGIN_URL` is unset, serves its own HTML pages (legacy).
+
+After the customer is verified, this server issues an authorization code. The browser returns to Shopify’s callback; Shopify exchanges the code at `/token` and opens the customer session.
 
 The login server is `https://jockey-auth.onrender.com`. It runs on Render’s free tier and sleeps when idle. Open [https://jockey-auth.onrender.com/health](https://jockey-auth.onrender.com/health) first and wait until it returns `{"ok":true}` before testing sign-in.
 
@@ -8,6 +13,7 @@ The login server is `https://jockey-auth.onrender.com`. It runs on Render’s fr
 
 - Store: [https://dev-store-2-ciaderoj.myshopify.com](https://dev-store-2-ciaderoj.myshopify.com)
 - Customer account: [https://shopify.com/84275495171/account](https://shopify.com/84275495171/account)
+- Theme login page (after setup): [https://dev-store-2-ciaderoj.myshopify.com/pages/jockey-login](https://dev-store-2-ciaderoj.myshopify.com/pages/jockey-login)
 
 ## What must be set
 
@@ -26,7 +32,21 @@ In Shopify admin: **Settings → Customer accounts → Identity provider**.
 
 `openid` and `email` are requested by Shopify already. `profile` is required for first and last name. `phone` is required for the mobile number.
 
+**Do not put the storefront URL in well-known.** `authorization_endpoint`, `token_endpoint`, `jwks_uri`, `userinfo_endpoint`, and `end_session_endpoint` stay on this server.
+
 Callback and sign-out URLs shown on that page must be listed in `REDIRECT_URIS` and `POST_LOGOUT_REDIRECT_URIS`. Shopify calls the token endpoint with HTTP Basic auth (`client_secret_basic`).
+
+### Shopify theme login page
+
+In Shopify admin: **Online Store → Pages → Add page**.
+
+| Field | Value |
+|---|---|
+| Title | Sign in (or any title) |
+| Handle / URL and handle | `jockey-login` |
+| Theme template | `page.jockey-login` |
+
+The theme section setting **Auth server URL** should be this server’s public base URL (default `https://jockey-auth.onrender.com`). Never put `CLIENT_SECRET` or private keys in the theme.
 
 ### Shopify Admin API
 
@@ -48,6 +68,8 @@ This token is not the identity-provider client id, and it is not the Customer Ac
 | `REDIRECT_URIS` | Allowing Shopify's login callback |
 | `POST_LOGOUT_REDIRECT_URIS` | Allowing Shopify's logout callback |
 | `SHOPIFY_SHOP` / `SHOPIFY_ADMIN_ACCESS_TOKEN` | Reading and updating the Shopify customer |
+| `STOREFRONT_LOGIN_URL` | Theme login page URL; when set, `/authorize` redirects there with a `ticket` |
+| `STOREFRONT_ORIGIN` | CORS allowlist for JSON login APIs (defaults to origin of `STOREFRONT_LOGIN_URL`) |
 | `STATIC_OTP` | Optional fixed OTP. If empty, a random 4-digit OTP is used |
 
 The login server keeps its own profile per phone number in our database. That record is separate from the Shopify customer. A name or email already in our database is kept. Shopify is used only to fill a field our database does not have yet. On a successful login, the saved profile is written back to the Shopify customer.
@@ -56,33 +78,50 @@ The login server keeps its own profile per phone number in our database. That re
 
 1. The customer starts sign-in on the store.
 2. Shopify opens `GET /authorize` with `response_type=code`, `client_id`, `redirect_uri`, `scope`, `state`, `nonce`, and PKCE `code_challenge`.
-3. The customer enters an Indian mobile number. The country code is fixed as `+91`. The number must match `^[6-9]\d{9}$`. Pasting or autofilling a full number sends the OTP immediately.
-4. The server sends a 4-digit OTP. It expires in 5 minutes. More than 5 wrong attempts requires a new OTP.
-5. After the OTP matches, the server loads the phone from our database and from Shopify (`customerByIdentifier` by phone).
-6. A field already stored for that phone is kept. Shopify fills a field only when this server does not have it yet.
-7. The form asks only for what is still missing:
-   - First or last name missing: both name fields. A name that is already known can be changed.
-   - Both names present, email missing: email only.
-   - Email, first name, and last name all present: no form.
-8. The server saves that profile, then updates the Shopify customer with `customerUpdate` (`firstName`, `lastName`, `email`). Login still completes if Shopify rejects the update.
-9. The server redirects back to Shopify with a one-time `code` and the original `state`.
-10. Shopify posts that code to `POST /token` with the client id and secret. The server returns an access token, a refresh token, and an ID token.
-11. Shopify opens the customer session. With customer data sync on, it can also copy empty customer fields from the ID token.
+3. This server validates the request and creates a login session.
+4. If `STOREFRONT_LOGIN_URL` is set, the browser is redirected to that page with an opaque `ticket` query param. The theme UI then calls:
+   - `POST /api/login/phone` — send OTP
+   - `POST /api/login/verify` — verify OTP
+   - `POST /api/login/resend` — new OTP for the same phone
+   - `POST /api/login/profile` — save missing name/email when needed  
+   Each request sends `X-Login-Ticket` (or `ticket` in the JSON body). CORS allows only `STOREFRONT_ORIGIN`.
+5. If `STOREFRONT_LOGIN_URL` is unset, this server returns HTML for phone → OTP → optional profile (same rules).
+6. The customer enters an Indian mobile number. The country code is fixed as `+91`. The number must match `^[6-9]\d{9}$`. Pasting or autofilling a full number sends the OTP immediately.
+7. The server sends a 4-digit OTP. It expires in 5 minutes. More than 5 wrong attempts requires a new OTP.
+8. After the OTP matches, the server loads the phone from our database and from Shopify (`customerByIdentifier` by phone).
+9. A field already stored for that phone is kept. Shopify fills a field only when this server does not have it yet.
+10. The UI asks only for what is still missing:
+    - First or last name missing: both name fields. A name that is already known can be changed.
+    - Both names present, email missing: email only.
+    - Email, first name, and last name all present: no form.
+11. The server saves that profile, then updates the Shopify customer with `customerUpdate` (`firstName`, `lastName`, `email`). Login still completes if Shopify rejects the update.
+12. The API returns `{ "redirectTo": "<Shopify callback>?code=...&state=..." }`. The theme navigates there (HTML fallback uses an HTTP 302).
+13. Shopify posts that code to `POST /token` with the client id and secret. The server returns an access token, a refresh token, and an ID token.
+14. Shopify opens the customer session. With customer data sync on, it can also copy empty customer fields from the ID token.
 
 Logout is `GET /logout?post_logout_redirect_uri=...`. The redirect must be in `POST_LOGOUT_REDIRECT_URIS`.
 
 ## Where the pages come from
 
-No login UI is installed on the Shopify storefront. The store only starts Shopify's customer sign-in. Shopify then sends the browser to this server's `/authorize` URL. Every page the customer fills in is HTML returned by this server:
-
-| Step | This server returns |
+| Mode | Who renders phone / OTP / profile |
 |---|---|
-| Start | Phone page. Country code is fixed as `+91`. The customer enters the 10-digit number. |
-| After a valid number | OTP page for that number. |
-| After a valid OTP, if profile fields are missing | Name and/or email page. Which fields appear is decided by the merge rules below. |
-| After the profile is complete | No page. HTTP redirect to Shopify's callback with `code` and `state`. |
+| `STOREFRONT_LOGIN_URL` set | Shopify theme page (`page.jockey-login`) |
+| Unset | HTML from this server |
 
-The storefront is not involved again until Shopify has exchanged that code and the customer is signed in.
+OIDC endpoints (`/authorize`, `/token`, JWKS, `/userinfo`, `/logout`) always stay on this server. The theme never receives `CLIENT_SECRET` or the private signing key. Cross-origin login uses the opaque ticket, not the IdP session cookie.
+
+## JSON login API
+
+All routes require a valid ticket. Request JSON; response JSON.
+
+| Method | Path | Body | Success |
+|---|---|---|---|
+| POST | `/api/login/phone` | `{ "phone": "9876543210" }` | `{ "ok": true, "phone": "+91..." }` |
+| POST | `/api/login/resend` | `{ "phone": "9876543210" }` optional if session already has phone | `{ "ok": true, "phone": "+91..." }` |
+| POST | `/api/login/verify` | `{ "otp": "1234" }` | `{ "redirectTo": "..." }` or `{ "needProfile": true, "fields": { ... } }` |
+| POST | `/api/login/profile` | `{ "firstName", "lastName", "email" }` as needed | `{ "redirectTo": "..." }` |
+
+Errors return `{ "error": "message" }` with 4xx status.
 
 ## Validation to implement
 
@@ -157,3 +196,13 @@ When login succeeds, that merged profile is saved in our database and written to
 |---|---|
 | `CLIENT_ID` / `CLIENT_SECRET` | Shopify, when it talks to this login server |
 | Customer Account API client id | The storefront app, when it calls Shopify after the customer is signed in |
+
+## End-to-end checklist
+
+1. Wake the IdP: `GET /health` → `{"ok":true}`.
+2. Confirm env: `STOREFRONT_LOGIN_URL` and `STOREFRONT_ORIGIN` (or rely on origin derived from the login URL).
+3. Confirm the theme page exists with handle `jockey-login` and template `page.jockey-login`.
+4. Start sign-in from the store → browser hits IdP `/authorize` → redirects to theme with `ticket`.
+5. Happy path: phone → OTP → (profile if needed) → Shopify callback → customer session.
+6. Errors: bad phone, wrong OTP, expired OTP, too many attempts, duplicate email.
+7. Network tab: no client secret in theme JS; final navigation lands on Shopify callback with `code` and `state`.
