@@ -340,8 +340,16 @@ app.get('/userinfo', (req, res) => {
 });
 
 app.get('/logout', (req, res) => {
-  const target = String(req.query.post_logout_redirect_uri || '');
+  const target = String(req.query.post_logout_redirect_uri || '').trim();
+
+  // Mobile Customer Account clients often call end_session as an API and expect
+  // 200 OK with no redirect when post_logout_redirect_uri is omitted.
+  if (!target) {
+    return res.status(200).json({ ok: true });
+  }
+
   if (!POST_LOGOUT_REDIRECT_URIS.includes(target)) {
+    console.log(`[logout] rejected post_logout_redirect_uri=${target}`);
     return res.status(400).json({ error: 'invalid_post_logout_redirect_uri' });
   }
   res.redirect(302, target);

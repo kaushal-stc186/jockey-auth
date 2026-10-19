@@ -99,7 +99,7 @@ The login server keeps its own profile per phone number in our database. That re
 13. Shopify posts that code to `POST /token` with the client id and secret. The server returns an access token, a refresh token, and an ID token.
 14. Shopify opens the customer session. With customer data sync on, it can also copy empty customer fields from the ID token.
 
-Logout is `GET /logout?post_logout_redirect_uri=...`. The redirect must be in `POST_LOGOUT_REDIRECT_URIS`.
+Logout is `GET /logout`. If `post_logout_redirect_uri` is present, it must be listed in `POST_LOGOUT_REDIRECT_URIS` and the response is a 302. If it is omitted (common for mobile Customer Account clients), the server returns `200` with `{ "ok": true }`. Copy every Logout URL from Shopify Admin → Customer accounts → Identity provider into `POST_LOGOUT_REDIRECT_URIS`.
 
 ## Where the pages come from
 
