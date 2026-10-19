@@ -44,9 +44,9 @@ In Shopify admin: **Online Store → Pages → Add page**.
 |---|---|
 | Title | Sign in (or any title) |
 | Handle / URL and handle | `jockey-login` |
-| Theme template | `page.jockey-login` |
+| Theme template | `page.jockey-login` (uses layout `jockey-login` — no store header/footer) |
 
-The theme section setting **Auth server URL** should be this server’s public base URL (default `https://jockey-auth.onrender.com`). Never put `CLIENT_SECRET` or private keys in the theme.
+The theme section setting **Auth server URL** should be this server’s public base URL (default `https://jockey-auth.onrender.com`). Never put `CLIENT_SECRET` or private keys in the theme. The login UI matches the Jockey storefront modal look (logo header, phone, 4-box OTP, profile).
 
 ### Shopify Admin API
 
